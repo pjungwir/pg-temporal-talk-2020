@@ -570,7 +570,7 @@ Note:
   - That's what the spec says.
   - I don't see why we couldn't accept expressions, column values, maybe even subqueries.
   - At least NOW(), right?
-    - No other RDMBS accepts NOW() there though....
+    - Mariadb accepts NOW() and date arithmetic functions, maybe other things.
 
 
 
