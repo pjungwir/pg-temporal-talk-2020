@@ -567,10 +567,12 @@ Note:
 - This is from `gram.y`
 - `range_name` is a column name or PERIOD name.
 - `target_start` and `target_end` are always strings.
-  - That's what the spec says.
   - I don't see why we couldn't accept expressions, column values, maybe even subqueries.
+    - The spec says not to accept columns.
+    - Functions are allowed if they are deterministic and don't modify data.
   - At least NOW(), right?
     - Mariadb accepts NOW() and date arithmetic functions, maybe other things.
+  - So really I need to build an expression tree here.
 
 
 
@@ -676,7 +678,6 @@ Note:
 - fc is the range constructor expression from above
 - The "target list" is all the things the UPDATE will update
   - (or that SELECT will select, incidentally).
-- foo*
 
 
 
