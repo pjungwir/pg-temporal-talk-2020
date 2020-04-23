@@ -82,6 +82,7 @@ int4range | int4multirange
 tsrange   | tsmultirange 
 ...       | ...
 anyrange  | anymultirange 
+anycompatiblerange  | anycompatiblemultirange
 textrange | textmultirange
 
 Note:
