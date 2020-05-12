@@ -549,13 +549,13 @@ Note:
 
 ```
 for_portion_of_clause:
-      FOR PORTION OF ColId FROM Sconst TO Sconst
+      FOR PORTION OF ColId FROM a_expr TO a_expr
         {
           ForPortionOfClause *n = makeNode(ForPortionOfClause);
           n->range_name = $4;
           n->range_name_location = @4;
-          n->target_start = makeStringConst($6, @6);
-          n->target_end = makeStringConst($8, @8);
+          n->target_start = $6
+          n->target_end = $8
           $$ = n;
         }
       | /*EMPTY*/         { $$ = NULL; }
@@ -565,14 +565,102 @@ for_portion_of_clause:
 Note:
 
 - This is from `gram.y`
-- `range_name` is a column name or PERIOD name.
-- `target_start` and `target_end` are always strings.
-  - I don't see why we couldn't accept expressions, column values, maybe even subqueries.
-    - The spec says not to accept columns.
-    - Functions are allowed if they are deterministic and don't modify data.
-  - At least NOW(), right?
-    - Mariadb accepts NOW() and date arithmetic functions, maybe other things.
-  - So really I need to build an expression tree here.
+- `range_name` is a range column name (or in the future also a PERIOD name).
+- `target_start` and `target_end` are endpoints used to build another range.
+  - Note that these take expressions.
+  - At first I only accepted literal strings because a shift/reduce conflict made things tricky.
+  - Obviously that's not sufficient.
+    - You certainly need NOW() and time-related functions.
+    - The spec disallows column references and non-deterministic functions,
+      - so basically you're getting constant bounds.
+
+
+
+# UPDATE/DELETE: Parse
+
+```
+UPDATE for_portion_of_test
+FOR PORTION OF valid_at
+  FROM '2018-03-01' AT TIME ZONE INTERVAL '1' DAY TO HOUR
+    TO '2019-01-01'
+    SET name = 'one^3'
+    WHERE id = '[1,2)';
+```
+
+Note:
+
+- Here is the problem
+  - I've never used this way of giving a time zone,
+    but it's from the SQL standard.
+    - I'm not even sure what it means,
+      or what purpose it serves.
+      I couldn't find it in our documentation,
+      but we have tests for it.
+  - After bison reads the DAY in "DAY TO HOUR",
+    should it keep parsing the interval (i.e. shift)
+    or should it end the FROM part (reduce)?
+
+
+
+# UPDATE/DELETE: Parse
+
+```
+state 1855
+
+  1923 opt_interval: DAY_P .
+  1928             | DAY_P . TO HOUR_P
+  1929             | DAY_P . TO MINUTE_P
+  1930             | DAY_P . TO interval_second
+
+    TO  shift, and go to state 2611
+
+    TO        [reduce using rule 1923 (opt_interval)]
+    $default  reduce using rule 1923 (opt_interval)
+```
+
+Note:
+
+- Here is bison's debugging output about the problem.
+  - The dot is bison's current position.
+    - So it's just read the token "DAY".
+    - TO is the lookahead token.
+    - Should it reduce (i.e. finish the current rule about intervals)
+      or shift (i.e. keep going in the current rule)?
+- If you *do* use this interval feature, there is no ambiguity, because we have TO twice.
+  - We can see that, but bison can't because it has only one lookahead token.
+- If you have TO once there is also no ambiguity: it must belong to FOR PORTION OF.
+- But I don't know how to teach bison that.
+
+
+
+# UPDATE/DELETE: Parse
+
+```
+if (foo)
+  if (bar)
+    stmt1
+  else
+    stmt2
+```
+
+Note:
+
+- It's a lot like this classic shift/reduce problem:
+  - Where does the else go?
+- Historically we've always attached the else to the nearest if.
+  - That's what I do as well:
+    - The TO belongs to the interval.
+      - I gave TO a higher precedence that the DAY/HOUR/etc tokens.
+  - I think attaching the TO to the FOR PORTION OF would be better actually,
+    since the interval feature is so obscure.
+    - But I couldn't do that without breaking intervals everywhere.
+  - I doubt it will be a common issue in practice.
+    - Who writes time zones like this?
+    - You should use time zone names instead of offsets anyway, so they work on both sides of Daylight Savings Time.
+    - You can always add parens if you need to.
+- I'll probably keep stubbornly trying to fix it,
+  - But if anyone wants to help, let me know.
+  - This isn't in a patch file yet, but it will be soon, and the code is in a branch on my personal github account.
 
 
 
@@ -687,19 +775,29 @@ Note:
 FOR PORTION OF valid_at
   FROM  '2020-05-30'
   TO    'Infinity'
+
+FOR PORTION OF valid_at
+  FROM  '2020-05-30'
+  TO    NULL
 ```
 
 Note:
 
 - How should we deal with "update from now until further notice"?
-- With ranges this is NULL.
-- In the spec you're supposed to have a sentinel like January 1, 3000.
-- That's so ugly though.
+- This isn't covered by the SQL standard.
+- In the standard you're supposed to have a sentinel like January 1, 3000.
+  - That's so ugly though.
+  - 'Infinity' could make an okay sentinel.
+  - It is a valid value for timestamps, dates, floats. Not ints.
+    - It'd be nice to support all types.
+- With ranges you express "unbounded" with NULL.
 - Oracle lets you have PERIODs with NULL endpoints and treats them how our ranges treat NULLs: unbounded.
   - I imagine our PERIODs should be the same.
 - But what do you write in the FOR PORTION OF?
-  - NULL? Maybe that's the right answer. Right now I only accept a string though.
-- But 'Infinity' and '-Infinity' are both strings, so that are accepted.
+  - I like NULL the best:
+    - Fits better with ranges.
+    - Works for all types.
+    - But it doesn't read as "naturally".
 
 
 
@@ -712,6 +810,7 @@ Note:
 
 Note:
 
+- Here's another issue.
 - What do you suppose this will be?
 
 
@@ -730,14 +829,25 @@ Note:
 Note:
 
 - But +/- Infinity cause problems because there is a tiny slice between infinity and null.
-- Also those strings aren't valid for any type you might make a range with.
-- (They are valid for all our built-in range types, but that's not good enough.)
-- So I feel like I need to change this. Maybe just accept NULL there too.
-- That still leaves a footgun for people to use `Infinity` and get weird effects.
-  - But that footgun already exists with ranges, and I've never heard anyone complain about it,
-  - ...so maybe it's not really an issue.
-- We could also have our own syntax where you can leave of `FROM` or `TO` entirely (or even both),
-  - that's non-standard but I kind of like it.
+- I used to have some code that detected literal `Infinity` and replaced it with NULL.
+  - That kind of "helpfulness" seems contrary to the Postgres approach.
+- But accepting Infinity here is surely a footgun.
+  - But it's the same footgun that already exists with ranges.
+    - I'm not really adding anything new.
+  - I'm inclined to just leave it, but add a warning in the documentation.
+
+  - This may be a bigger deal than it feels though (and it feels really small to me):
+    - I gave a trial run of this talk last month at my local Postgres meetup,
+      and someone said they had actually experienced the timestamp-vs-null problem with ranges,
+      and it made a big mess of their data until they figured out that infinity and null aren't the same.
+
+  - Maybe detect literal Infinity and print a warning?
+
+- We could also have our own syntax...
+  - where you can leave of `FROM` or `TO` entirely (or even both),
+  - or where you have some keyword like INFINITY.
+  - That's non-standard.
+    - I don't plan to do it but I kind of like it.
 
 
 
