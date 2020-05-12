@@ -2,8 +2,7 @@
 ## on Temporal Databases
 
 Paul A. Jungwirth<br/>
-23 April 2020<br/>
-pxdpug
+PGCon 2020
 
 Note:
 
