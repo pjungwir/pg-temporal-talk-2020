@@ -2,6 +2,7 @@
 ## on Temporal Databases
 
 Paul A. Jungwirth<br/>
+May 2020<br/>
 PGCon 2020
 
 Note:
@@ -25,10 +26,23 @@ Note:
   - Multiranges is close (I hope).
   - I want to talk about what these patches do, and also the approach I've used to implement them.
   - I'm happy for feedback on either of those things!
+  - And by the way I want to thank all the people who've contributed time reviewing those patches and offering feedback on the mailing list.
 
-- Another talk I'd love to give is what I've learned as a newbie about Postgres hacking.
-  - Both of these patches were great pedagogically to introduce me to different subsystems.
-  - That is really a whole other talk (or several), but I can't resist sprinkling in some things here and there.
+- I gave a talk at PGCon last year about how temporal database work and the SQL:2011 standard.
+- This year I'm going to focus more on the work I've done and the implementation side.
+  - I'll especially focus on hard parts where someone else may have a better idea.
+  - So this talk is really intended for Postgres hackers, although others might find it interesting.
+    - I'm kind of a dillettante Postgres hacker.
+      - It's not my full-time job, and usually I'm writing Ruby or Python or Javascript, maybe Java.
+      - My Postgres work is pretty much all in the evenings.
+      - But I've done C off-and-on since high school, and I love getting to work on something a bit more challenging than webapps.
+      - I've found Postgres a wonderful community to be a part of.
+      - I work with Postgres a lot, both as an application developer and doing DBA/sysadmin/devops things.
+        - I've written a bunch of extensions over the years, including a proof-of-concept for temporal primary & foreign keys.
+    - So working on these patches has taught me a lot,
+      and hopefully I can share some tidbits that might help other nighttime Postgres hackers.
+      - There are other talks and articles out there introducing Postgres hacking,
+        but there is room for another one, and maybe I'll give one some day.
 
 
 
@@ -38,8 +52,12 @@ Note:
 
 Note:
 
-- Range types have a start & stop
-- Multiranges are like ranges, but they can have gaps.
+- Multiranges is a new type. It's a lot like our existing range type, but a little different.
+- Here is green we have a range.
+  - It has upper and lower bounds.
+- In yellow we have a multirange.
+  - It's a sequence of non-touching ranges.
+  - So unlike a range, it can have gaps.
 
 
 
@@ -57,6 +75,9 @@ empty
 Note:
 
 - Here they are as strings.
+  - First are a couple ranges,
+  - then a couple multiranges
+  - Empty and empty
 - (next)
 - They are automatically canonicalized, so you can't get these.
 
@@ -71,6 +92,18 @@ Note:
 <div class="fragment">{[1,4)} + {[7,9)}   -- {[1,4), [7,9)}
 {[1,9)} - {[4,7)}   -- {[1,4), [7,9)}</div></code></pre>
 
+Note:
+
+- One thing multiranges add is mathematical closure.
+- By closure I don't mean when a function closes over outside variables.
+- The math concept of closure is that if you have a domain of values and an operator,
+  then the operator always gives a result form the same domain, no matter what inputs you use.
+  - So if you take the positive numbers, addition is closed, but not subtraction.
+- Ranges are not closed for union or difference (which we write as plus and minus), because both can give gaps.
+  - If you do this today Postgres raises an error.
+- (next)
+- But if you use multiranges, you don't get an error.
+
 
 
 # Multiranges
@@ -80,14 +113,21 @@ ranges    | multiranges
 int4range | int4multirange 
 tsrange   | tsmultirange 
 ...       | ...
+textrange | textmultirange
+...       | ...
 anyrange  | anymultirange 
 anycompatiblerange  | anycompatiblemultirange
-textrange | textmultirange
 
 Note:
 
 - Every built-in range type comes with a multirange type
+  - Strictly speaking ranges and multiranges are not types but types of types.
+    - There is int4range, daterange, etc.
 - Creating a new range type automatically creates a new multirange type
+- Here I'm showing a couple built-in ranges,
+  a custom range,
+  and range polymorphic types.
+  - They all have multirange equivalents.
 
 
 
@@ -106,25 +146,35 @@ typedef struct
 
 Note:
 
+- Here's the memory layout of a multirange.
 - They are varlena.
-  - They have a count and then a bunch of ranges.
-  - When iterating over the ranges you have to advance the pointer.
-    - There is a `multirange_deserialize` function that gives you a `RangeType**` to avoid that.
+  - They have the oid of the concrete multirange type.
+  - Next they have a count and then a bunch of ranges.
+  - Because range types are also varlena, we can't include them in the struct here.
+    - In fact inside a range type, the upper and lower bounds can be varlena too.
+    - So ranges have a similar-looking struct that only has the type oid.
+  - So when iterating over the ranges you have to advance a pointer by hand.
+    - There is a `multirange_deserialize` function that gives you a `RangeType**` to hide those details.
 
 - Btw a lot of the code I'll show has comments omitted and whitespace changed
   so what I want to show will fit on a slide.
   - Don't be alarmed! :-)
 
-- Got a request to store less than the full RangeType in each entry,
+- I got a request to store less than the full RangeType in each entry,
   since they all contain the same type oid.
+  - You already have the multirange type oid, so you don't need the range type oid at all.
+  - But we include it in the range type struct over and over.
   - But only for on-disk possibly.
   - I actually don't know how to have an on-disk format different from in-memory.
+    - Maybe someone can help me understand how to do that.
   - But since most access goes through `multirange_deserialize` already,
     I think I could store something smaller and build the `RangeType` list on the fly.
+    - I'm skeptical this would actually be a performance win though, compared to the inefficiency of repeating the range type oid.
+      - Maybe more experienced hackers can share their judgment about that.
 
 
 
-# Multiranges: Operators
+# Multiranges: Memory
 
 ```
 *ranges = palloc0(*range_count * sizeof(RangeType *));
@@ -146,6 +196,7 @@ Note:
 
 - this is from `multirange_deserialize`:
   - it does the pointer hopping to give you a list of ranges.
+  - There are alignment issues too because ranges have to be aligned, and so do their upper and lower bounds.
 
 
 
@@ -218,6 +269,10 @@ Note:
 
 Note:
 
+- Postgres has this polymorphic type system to let you write generic functions.
+  - There is already an anyrange type, and I added an anymultirange type.
+- Here are a few of the polymorphic types along with examples of a concrete type.
+- The concrete types have to all be compatible.
 - If any of these are known, the polymorphic type system can infer the others.
 - Except a known element/array doesn't let you infer the range/multirange,
   because you can define multiple range types for the same base type.
@@ -267,16 +322,30 @@ Note:
 
 Note:
 
+- When you use operators in WHERE conditions or JOINs,
+  the Postgres planner has to decide how to fit that into the broader query.
+  - The biggest question is how many rows you're going to get back.
+    - If your condition returns practically the whole table, it's faster to ignore indexes and do a full table scan.
+    - We can also make better decisions about how to nest our loops, when to build in-memory bitmaps, etc.
+  - So Postgres keeps statistics on the distribution of values in every column,
+    and then it calls selectivity functions to estimate what portion of the table a condition will return.
+    - Your selectivity functions can consult the statistics and return a number from 0 to 1.
 - Still working on this actually
+  - Collecting the statistics is done.
+  - Computing selectivities is mostly done.
 - I added a `multirangesel` function
+  - Here I'm showing the details for the overlaps operator.
+    - We're telling it to use my multirangesel function to compute selectivity.
 - A lot like ranges
-- Analysis builds historgrams of lower/upper and length
-- Selectivity is easy (scalar-like) for everything but contains/overlaps.
+- Analysis builds histograms of lower/upper bounds and length
+- Selectivity is easy (similar to scalars) for everything but contains/overlaps.
   - Those require both a lower/upper and a length.
   - This is just what rangesel does.
 - This will be biased toward denser multiranges: ones without gaps.
   - Probably good to add a "density" histogram we can combine with length
     - Or even redefine length as length times density.
+
+- That's all I have to say about multiranges, so let's talk about temporal features.
 
 
 
@@ -292,9 +361,12 @@ Note:
 
 - This is what you say to define a temporal primary key.
 - Id is an ordinary column, like an integer.
+  - I'll call this the "scalar" part, maybe betraying some Perl influence.
+  - It can be whatever type you like.
+  - You can multiple columns.
 - `valid_at` is a range column, or hopefully soon a PERIOD.
-  - PERIODs are weird SQL:2011 things that are like ranges but worse.
-  - I'd like to support both.
+  - PERIODs are weird SQL:2011 things that are like ranges but not as good.
+  - I'd like to support both for compatibility sake, but personally in my own projects I'll just use ranges.
 - Of course you can also specify a temporal PK in your CREATE TABLE.
 
 
@@ -306,6 +378,9 @@ Note:
 Note:
 
 - It's okay if you have a duplicate of the ID, but not if their times overlap.
+  - Imagine this is a table of houses.
+    - You have two records for house 1, maybe because it was re-appraised.
+      - It had one value in 2018 and another value in 2019.
 
 
 
@@ -344,8 +419,14 @@ CREATE CONSTRAINT fk_rooms_to_houses
 
 Note:
 
-- It's kind of a shame we use `WITHOUT OVERLAPS` for a PK and `PERIOD` for a FK.
+- Here is the syntax for a temporal foreign key.
+  - First you have the scalar part of the key.
+    - Again, there can be more than one column.
+  - Then you give a range.
+    - You need a range from the referencing table and from the referenced table.
+- Note that you use `WITHOUT OVERLAPS` for a PK and `PERIOD` for a FK.
   - Also note the `PERIOD` comes before the column name but `WITHOUT OVERLAPS` comes after.
+  - I apologize: that's just what SQL:2011 says you should do.
 - Of course you can also specify a temporal FK in your CREATE TABLE.
 
 
@@ -356,14 +437,50 @@ Note:
 
 Note:
 
-- The FK has to be present in the referenced table *for the whole time*
+- Here I'm showing two table, houses and rooms.
+  - Naturally rooms are child records of houses.
+    - You can't have a room if you don't have a house.
+  - The houses table has a couple green records.
+    - They are both for house 1.
+  - The rooms table has a yellow record and a red record.
+    - Room 1 and room 2.
+    - Suppose they both reference house 1.
+- The FK value has to be present in the referenced table *for the whole time*
+  - The red row is invalid: the room can't exist before the house does.
 - It might take more than one row in the PK table to cover the whole FK range.
-  - example
+  - The yellow row requires both house records to satistify it.
   - So how do you implement that?
     - You need to roll up all rows with the same scalar key part and combine their ranges into one big range.
       - Maybe the resulting range even has gaps.
       - Sounds like a job for ... multiranges!
-      - range_agg (hold that thought....)
+      - And the way we roll up values from multiple rows is with aggregate functions.
+      - So what we need is range_agg.
+
+
+
+# Foreign Keys
+
+```
+CREATE CONSTRAINT TRIGGER RI_ConstraintTrigger_c_454735
+  AFTER INSERT ON rooms FROM houses
+  NOT DEFERRABLE INITIALLY IMMEDIATE
+  FOR EACH ROW
+  EXECUTE PROCEDURE RI_FKey_check_ins();
+```
+
+Note:
+
+- Ordinary FKs are actually trigger, but they are special in two ways.
+  - First, they are constraint triggers.
+    - A constraint trigger is an ordinary trigger that can cancel a query, except like constraints it is deferrable.
+  - Second, FKs are "internal" triggers, which means you don't see them when you describe a table, etc.
+- They are AFTER ROW (like every constraint trigger).
+- There are 2 on the referencing table and 2 on the referenced table.
+  - Suppose we call these the "parent" and "child" tables.
+  - If you delete or update a parent, we have to make sure you didn't create any orphans in the child table.
+  - If you insert or update a child, we have to make sure its parent exists.
+    - So I'm showing SQL equivalent to what Postgres does to create the insert trigger on the child table.
+    - If you look in `pg_trigger` you can see it, and if you call `pg_get_triggerdef` on its oid you'll see this SQL.
 
 
 
@@ -375,18 +492,34 @@ FROM   houses x
 WHERE  id = $1
 FOR KEY SHARE OF x;
 ```
-<!-- .element: class="fragment" -->
 
 Note:
 
-- Ordinary FKs are actually hidden constraint triggers.
-- They are AFTER ROW.
-- There are 2 on the referencing table and 2 on the referenced table.
+- Here is the SQL that trigger runs.
+  - So we run this when the child table changes (the rooms table).
+  - $1 is the FK value.
+  - If we had multiple columns then you'd see a $2, $3, etc.
+  - We're just making sure that the PK exists on the parent table.
+- This is the "interesting" side of the relationship.
+  - Checking the child table when a PK changes is easier.
+
+
+
+# Foreign Keys
+
+```
+CREATE CONSTRAINT TRIGGER TRI_ConstraintTrigger_c_454735
+  AFTER INSERT ON rooms FROM houses
+  NOT DEFERRABLE INITIALLY IMMEDIATE
+  FOR EACH ROW
+  EXECUTE PROCEDURE TRI_FKey_check_ins();
+```
+
+Note:
+
 - Temporal FKs are the same way but just slightly different trigger functions.
-- In all cases the triggers just run some SQL to make sure the referential integrity still holds
-  - (next) Here is that SQL
-  - $1 is the new FK value.
-    - We want to make sure the PK has that value too.
+  - They start with TRI instead of RI (for Temporal Referential Integrity).
+- Like before, the triggers just run some SQL to make sure the referential integrity still holds.
 
 
 
@@ -406,25 +539,30 @@ HAVING $2 <@ range_agg(x1.r);
 
 Note:
 
-- Here is the same query but for temporal FKs
+- Here is that SQL.
+  - It's almost the same SQL as before.
+- $1 is the new FK value.
+  - We want to make sure the parent table's PK has that value too.
 - First the pedantic stuff:
   - Obviously the table and column names are not hardcoded.
   - More than one scalar column is supported.
   - If it's not a partitioned table we say `FROM ONLY` (like other FK checks)
 - $1 is the FK scalar value.
-- $2 is the FK range value.
+- After all the scalar keys, you have a $n+1, here $2.
+  - That's the range value.
 - Walk through:
   - So we pull out all the `valid_at` ranges for that ID...
-  - we only look at rows that overlap $2 as a small optimization. Rows outside of the FK range are irrelevant.
-  - merge them together...
+  - As an optimization we only look at rows that overlap $2. Rows outside of the FK range are irrelevant.
+  - We merge them together with range_agg...
   - and make sure they completely contain the FK range.
 - This is trickier than it needs to be because of the locking.
   - `FOR KEY SHARE` is a very light lock really just used for FK checks.
   - It doesn't support aggregate queries though, so we have to aggregate outside that subquery.
 - This query is for if the FK side changes.
-  - The query for if the PK side changes is simpler.
+  - Again, the query for if the PK side changes is simpler.
     - No need for `range_agg`.
     - It looks for FK rows that *still* match the old PK values.
+      - If it finds any, the constraint fails.
     - In fact no changes needed at all.
       - = operator for the scalar parts
       - && operator for the range part
@@ -449,6 +587,7 @@ Note:
   - What does it even mean?
     - I means we delete/update the affected region of the referencing table.
 - Cascade is actually easy to implement *if* we have temporal update/delete.
+  - A temporal update/delete is exactly what a temporal cascade does.
   - So let's go to that....
 
 
@@ -467,10 +606,16 @@ UPDATE houses
 
 Note:
 
-- Examples
-  - Update the property tax appraisal for the year.
-  - Discover a house wasn't build until 1960.
-- In implementation these are practically the same, so I'll treat them together.
+- Here is the syntax for a temporal update.
+  - We add this FOR PORTION OF clause to say what timeframe we want to target.
+- For example:
+  - Suppose we have a house and we want to update the property tax appraisal for the year 2020.
+  - We update just that timeframe.
+- Here we see a before and after.
+  - The green boxes are the same record, pre- and post-udpate.
+  - The yellow boxes are newly inserted records.
+    - The have the same values as the pre-update record, but their valid_at boundaries are changed.
+  - So doing a temporal update can actually cause inserts to happen.
 
 
 
@@ -488,6 +633,15 @@ DELETE FROM houses
 Note:
 
 - Delete is very similar
+  - Same syntax
+- For example:
+  - Suppose we discover a house wasn't built until 1960.
+- According to the standard, we're supposed to really delete the record,
+  - and then insert new records if there is anything left over.
+  - So the yellow box is a newly inserted record.
+  - If there were any leftovers *before* the deleted section, we'd insert a record for that too.
+- So like update, delete can cause inserts to happen.
+- In implementation UPDATE and DELETE are practically the same, so from now on I'll treat them together.
 
 
 
@@ -503,23 +657,25 @@ Note:
 Note:
 
 - unlike temporal integrity constraints, these go through the whole query pipeline.
-  - making keys are "utility" commands so they skip the planner & optimizer.
+  - making primary & foreign keys are "utility" commands so they skip the planner & optimizer.
   - But DML goes through all the steps.
 
 - Parse: just pull out the strings into appropriate structs. Don't try to do anything yet.
 - Analyze: make sure columns really exist, turn things into a Node tree for expressions, column references, function calls, operators.
-- Rewrite: transform the query if we think that will help.
+- Rewrite: transform the query if there are views or rewrite rules.
 - Plan: generate lots of possible plans.
   - Each plan is another tree of Nodes.
 - Optimize: choose the plan that seems best.
   - If you `EXPLAIN` you can see the plan's node tree, basically.
 - Execute: nodes that actually do everything.
-  - In my case, everything else was easy, just copying things from one struct to another,
+  - In my case, everything else was easy, practically just copying things from one struct to another,
   - ...but here things got really hard.
     - TupleTableSlots
     - Locking and transaction isolation
+  - I really owe my progress here to my wife, who let me go off to a cabin and work on it for a whole weekend, while she took care of our five kids.
 
-- I've noticed a lot of submissions on hackers get rejected because all the work happens in the process, e.g. in the analysis or rewriting phase
+- I've noticed on the mailing list that a lot of guest submissions get rejected because all the work happens in the wrong part of the process, e.g. in the analysis phase.
+  - Someone wrote a great post there a year or two ago explaining why you couldn't do all the work in the analyze phase. I wish I had it bookmarked!
 
 
 
@@ -565,6 +721,7 @@ Note:
 
 - This is from `gram.y`
 - `range_name` is a range column name (or in the future also a PERIOD name).
+- `range_name_location` is an ordinary bison thing so that error messages can point out where the problem is.
 - `target_start` and `target_end` are endpoints used to build another range.
   - Note that these take expressions.
   - At first I only accepted literal strings because a shift/reduce conflict made things tricky.
@@ -589,8 +746,12 @@ FOR PORTION OF valid_at
 Note:
 
 - Here is the problem
+  - An interval can use this "to hour" syntax.
+    - The "TO" has to be a smaller granularity than the interval itself.
+      - So you can have 1 year to month, 1 day to hour, etc.
+    - And you can use this to express the time zone offset.
   - I've never used this way of giving a time zone,
-    but it's from the SQL standard.
+    but apparently it's from the SQL standard.
     - I'm not even sure what it means,
       or what purpose it serves.
       I couldn't find it in our documentation,
@@ -623,8 +784,8 @@ Note:
   - The dot is bison's current position.
     - So it's just read the token "DAY".
     - TO is the lookahead token.
-    - Should it reduce (i.e. finish the current rule about intervals)
-      or shift (i.e. keep going in the current rule)?
+    - Should it shift (i.e. keep going in the current rule)
+      or reduce (i.e. finish the current rule about intervals)?
 - If you *do* use this interval feature, there is no ambiguity, because we have TO twice.
   - We can see that, but bison can't because it has only one lookahead token.
 - If you have TO once there is also no ambiguity: it must belong to FOR PORTION OF.
@@ -673,12 +834,15 @@ FOR PORTION OF valid_at
 
 Note:
 
-- Copy stuff from the previous struct to a new one with more information.
-- Make sure it's a column.
-- Make sure the column is a range.
-- Make sure the table has a temporal PK.
-- Make sure the range is part of the PK.
-- Building a lot of expression nodes.
+- So we'll move on to the analyze phase.
+- Here we copy stuff from the previous struct to a new one with more information.
+  - We're doing things like looking up oids, finding the type of things, etc.
+  - Lots of error-checking happens here.
+    - Make sure valid_at is a column.
+    - Make sure the column is a range column.
+    - Make sure the table has a temporal PK.
+    - Make sure the range is part of the PK.
+- We build up some helpful expression nodes.
 
 
 
@@ -706,7 +870,8 @@ Note:
 - So the analysis phase has to take the parse result and make real node trees.
 - Here we have a function call node.
   - It will call the range constructor with the FOR PORTION OF endpoints.
-  - We also build Node to call the "overlaps" operator on that range and the range column.
+  - We also build a Node to call the "overlaps" operator on that range and the range column.
+    - The range column is a Var node and is stored in `result`'s `range` field (not shown here).
 
 
 
@@ -730,13 +895,17 @@ else
 
 Note:
 
-- Use FOR POTION OF to add an implicit condition to the WHERE clause.
-- This is close to rewriting; maybe it's even in the wrong place.
-- If you `EXPLAIN` then you see this other condition.
+- Here's another snippet from the analyze phase.
+- We use FOR POTION OF to add an implicit condition to the WHERE clause.
+  - We only want to hit records that overlap the range you're targeting.
+  - This is close to the offense I described above; maybe it's even in the wrong place.
+    - If you use `EXPLAIN` then you see this extra condition.
+      - But in my opinion that's actually desirable here.
 
 
 
 # UPDATE: Analyze
+<!-- .slide: style="font-size: 85%" -->
 
 ```
 Expr *rangeSetExpr = (Expr *) makeSimpleA_Expr(
@@ -762,7 +931,7 @@ Note:
 
 - We also build a Node for the "intersects" operator,
   which we use to UPDATE the range column.
-- fc is the range constructor expression from above
+- fc is the range constructor call from above.
 - The "target list" is all the things the UPDATE will update
   - (or that SELECT will select, incidentally).
 
@@ -783,20 +952,24 @@ FOR PORTION OF valid_at
 Note:
 
 - How should we deal with "update from now until further notice"?
-- This isn't covered by the SQL standard.
+  - This is really important: it's what you'll use more often than not.
+- This isn't addressed specifically by the SQL standard.
 - In the standard you're supposed to have a sentinel like January 1, 3000.
   - That's so ugly though.
   - 'Infinity' could make an okay sentinel.
   - It is a valid value for timestamps, dates, floats. Not ints.
-    - It'd be nice to support all types.
+    - It'd be nice to support all types, although officially we don't have to.
 - With ranges you express "unbounded" with NULL.
-- Oracle lets you have PERIODs with NULL endpoints and treats them how our ranges treat NULLs: unbounded.
+- Oracle uses NULL the same way btw.
+  - It lets you have PERIODs with NULL endpoints and treats them how our ranges treat NULLs: unbounded.
   - I imagine our PERIODs should be the same.
 - But what do you write in the FOR PORTION OF?
-  - I like NULL the best:
+  - Do you write NULL? That seems a little awkward.
+    - Writing 'Infinity' might feel more natural.
+  - Nevertheless I like NULL the best:
     - Fits better with ranges.
     - Works for all types.
-    - But it doesn't read as "naturally".
+    - But still I fear some people won't think of it.
 
 
 
@@ -811,6 +984,9 @@ Note:
 
 - Here's another issue.
 - What do you suppose this will be?
+  - We're taking a range that goes out to infinity (with NULL),
+    and sutracting everything out to infinity (with the string Infinity).
+  - Will it be the empty range?
 
 
 
@@ -827,7 +1003,9 @@ Note:
 
 Note:
 
-- But +/- Infinity cause problems because there is a tiny slice between infinity and null.
+- No! We're left with a tiny slice: the range from infinity and beyond.
+- So using +/- Infinity causes problems because there is this tiny slice left over.
+  - As your database ages, you're going to have a bunch of records with just this sliver of nonsense time.
 - I used to have some code that detected literal `Infinity` and replaced it with NULL.
   - That kind of "helpfulness" seems contrary to the Postgres approach.
 - But accepting Infinity here is surely a footgun.
@@ -839,6 +1017,7 @@ Note:
     - I gave a trial run of this talk last month at my local Postgres meetup,
       and someone said they had actually experienced the timestamp-vs-null problem with ranges,
       and it made a big mess of their data until they figured out that infinity and null aren't the same.
+      So maybe we need to do something.
 
   - Maybe detect literal Infinity and print a warning?
 
@@ -875,6 +1054,7 @@ Note:
 
 
 # UPDATE/DELETE: Execute
+<!-- .slide: style="font-size: 85%" -->
 
 ```
 // executor/modifyTableNode.c
@@ -892,6 +1072,8 @@ resultRelInfo->ri_forPortionOf->fp_targetRange = targetRangeType;
 
 Note:
 
+- In the execute phase, we have to do one extra thing:
+  - Perform the extra inserts for leftovers before and after the targeting range.
 - First we need to evaluate the target range.
   - Remember we built a Node for the range constructor function.
   - Now we actually evaluate the function.
@@ -918,13 +1100,15 @@ Note:
 - Honestly I barely understand the TupleTableSlots, but I think it's like this:
   - A tuple table is a collection of tuples, and a slot holds one tuple.
     - The slot isn't the tuple itself:
-      - it has metadata about the tuple, like whether it's part of a table etc.
+      - it has metadata about the tuple, like whether it's part of a table or just some expression, etc.
     - There are functions to store a tuple into a slot or get it out again.
   - We initialize a tuple table slot in `ExecInitModifyTable` which runs once for the whole statement,
     - And then we use it later once per row.
+  - If someone knows of a good document I can read about tuple table slots, I'd love to know about it.
 - So the first line stores the tuple into the slot based on tupleid.
   - I suspect `SnapshotAny` is wrong....
-- Next we pull out a `Datum`.
+  - I was surprised the tuple we're currently updating wasn't already "loaded" and available somewhere, but I couldn't find it.
+- Next we pull out a `Datum`, which is what `oldRange` is.
   - A `Datum` is just Postgres's generic type for any value.
   - There are macros to convert it to whatever type you like, here to a range type.
 
@@ -943,10 +1127,11 @@ range_leftover_internal(
 
 Note:
 
-- Find out if the current tuple's range extends past the FOR PORTION OF range,
+- I added this range function that does what we need.
+- We find out if the current tuple's range extends past the FOR PORTION OF range,
   - either on the left or on the right.
   - Store the leftovers in `leftoverRangeType1` and `leftoverRangeType2`.
-    - We need to insert those are new rows in the table.
+    - We need to insert those as new rows in the table.
 
 
 
@@ -969,11 +1154,19 @@ ExecInsert(mtstate, leftoverTuple1, planSlot,
 
 Note:
 
-- Suppose we have some leftovers below the target range.
+- Suppose we have some leftovers before the target range.
   - We extract the current tuple from its slot.
   - We copy it into `leftoverTuple1` as a "minimal tuple" which means we can manipulate its Datums in memory.
   - Then we set the Datum for the `valid_at` column.
   - Then we insert the tuple into the table.
+- Similar code handles leftovers after the target range.
+
+- To be honest, I wasn't totally happy with all this.
+  - It felt too specific for being in this modify table node, like I was mixing widely different levels of abstraction.
+    - Nothing else in there references specific types, for instance.
+    - I had to add several `#include` statements to the top to give myself access to the functions I needed.
+
+- It was fun to learn about executor nodes, but maybe it's the wrong approach.
 
 
 
@@ -996,22 +1189,33 @@ Note:
 
 Note:
 
-- But actually I think I could rip out all these executor changes,
+- And actually I think I could rip out all these executor changes,
   if only I could implement the secondary INSERTs in a trigger.
   - We saw how FKs use hidden triggers already.
   - This would also be an AFTER ROW trigger.
-  - I just need some way to tell the trigger how was in the FOR PORTION OF clause,
+  - I just need some way to tell the trigger what was in the FOR PORTION OF clause,
     - and whether that clause was even used.
       - It needs to know whether this a temporal UPDATE/DELETE or a normal one.
+      - Right now there's no way to do that.
 
 - This struct is info that gets passed to every trigger function.
-  - In plpgsql triggers these are available as `TG_*` variables.
-- Add the FOR PORTION OF to the trigger struct.
+  - In C you get this struct directly.
+  - In plpgsql these are available as `TG_*` variables.
+- So what if we added the FOR PORTION OF target to the struct?
   - Maybe it should be a Datum instead?
+    - That feels more correct to me.
     - If so then I need a second field saying whether it's NULL (i.e. FOR PORTION OF wasn't used).
+
+- My current patch has the executor node approach, but I plan to try out this trigger approach instead.
+  - Let me know what you think!
 
 
 
 # Thanks!
 
 https://github.com/pjungwir/pg-temporal-talk-2020
+
+Note:
+
+- These slides are available on Github.
+- If you have any feedback or questions I'd be glad to hear it.
