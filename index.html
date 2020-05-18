@@ -21,6 +21,21 @@
 			link.href = window.location.search.match( /print-pdf/gi ) ? 'css/print/pdf.css' : 'css/print/paper.css';
 			document.getElementsByTagName( 'head' )[0].appendChild( link );
 		</script>
+
+    <style>
+      #camera {
+        width: 200px;
+        height: 150px;
+        background-color: #666;
+        position: fixed;
+        right: 10px;
+        bottom: 10px;
+        z-index: 12;
+      }
+      .camera-hidden {
+        display: none;
+      }
+    </style>
 	</head>
 	<body>
 		<div class="reveal">
@@ -33,6 +48,7 @@
         </section>
 			</div>
 		</div>
+    <video autoplay="true" id="camera" class="camera-hidden"></video>
 
 		<script src="js/reveal.js"></script>
 
@@ -49,6 +65,20 @@
 					{ src: 'plugin/notes/notes.js', async: true }
 				]
 			});
+
+      if (false) {
+        var camera = document.querySelector("#camera");
+        camera.classList.remove("camera-hidden");
+        if (navigator.mediaDevices.getUserMedia) {
+          navigator.mediaDevices.getUserMedia({video: true})
+            .then(function(stream) {
+              camera.srcObject = stream;
+            })
+            .catch(function(err) {
+              console.log("Can't play video", err);
+            });
+        }
+      }
 		</script>
 	</body>
 </html>
