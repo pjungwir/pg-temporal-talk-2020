@@ -385,6 +385,7 @@ Note:
 
 
 # Primary Keys
+<!-- .slide: style="font-size: 95%" -->
 
 ```
 IndexElem *iparam = makeNode(IndexElem);
@@ -616,6 +617,7 @@ Note:
   - The yellow boxes are newly inserted records.
     - The have the same values as the pre-update record, but their valid_at boundaries are changed.
   - So doing a temporal update can actually cause inserts to happen.
+    - If you have insert triggers on the table, those fire on the secondary inserts!
 
 
 
@@ -701,6 +703,7 @@ Note:
 
 
 # UPDATE/DELETE: Parse
+<!-- .slide: style="font-size: 95%" -->
 
 ```
 for_portion_of_clause:
