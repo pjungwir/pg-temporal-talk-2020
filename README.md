@@ -5,6 +5,8 @@ These are the slides and my notes for a talk about temporal databases given at p
 You also can get [all the slides as a PDF](slides.pdf),
 or [read the slides' Markdown with speaker notes](slides.md).
 
+The video is [on my site](https://illuminatedcomputing.com/pages/pgcon2020/).
+
 ## Development
 
 You can run the slides locally by saying:
